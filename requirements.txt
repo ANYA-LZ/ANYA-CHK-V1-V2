@@ -3,3 +3,5 @@ requests
 Faker
 lxml
 gunicorn
+urllib3
+python-dateutil
