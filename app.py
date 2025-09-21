@@ -313,7 +313,7 @@ def get_bar_auth_token(card_info, random_person, access_token):
         'Content-Type': 'application/json',
     }
 
-    payload = {
+    payload_v2 = {
         "clientSdkMetadata": {
             "source": "client",
             "integration": "custom",
@@ -340,11 +340,35 @@ def get_bar_auth_token(card_info, random_person, access_token):
         "operationName": "TokenizeCreditCard"
     }
 
+    payload_v1 = {
+        "clientSdkMetadata": {
+            "source": "client",
+            "integration": "custom",
+            "sessionId": fake.uuid4()
+        },
+        "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {   tokenizeCreditCard(input: $input) {     token     creditCard {       bin       brandCode       last4       cardholderName       expirationMonth      expirationYear      binData {         prepaid         healthcare         debit         durbinRegulated         commercial         payroll         issuingBank         countryOfIssuance         productId       }     }   } }",
+        "variables": {
+            "input": {
+            "creditCard": {
+                "number": card_info['number'],
+                "expirationMonth": card_info['month'],
+                "expirationYear": card_info['year'],
+                "cvv": card_info['cvv']
+            },
+            "options": {
+                "validate": False
+            }
+            }
+        },
+        "operationName": "TokenizeCreditCard"
+    }
+
+
     try:
         response = requests.post(
             'https://payments.braintree-api.com/graphql',
             headers=headers,
-            json=payload,
+            json=payload_v1,
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
@@ -449,14 +473,8 @@ def generate_payload_payment(random_person, gateway_config, card_info, cookies):
                 'wc_braintree_credit_card_payment_nonce': token,
                 'wc_braintree_device_data': json.dumps({"correlation_id": str(fake.uuid4())}),
                 'wc-braintree-credit-card-tokenize-payment-method': "true",
-                'wc_braintree_paypal_payment_nonce': "",
-                'wc-braintree-paypal-context': "shortcode",
-                'wc_braintree_paypal_amount': "0.00",
-                'wc_braintree_paypal_currency': "USD",
-                'wc_braintree_paypal_locale': "en_us",
-                'wc-braintree-paypal-tokenize-payment-method': "true",
                 'woocommerce-add-payment-method-nonce': nonce,
-                '_wp_http_referer': "/my-account/add-payment-method/",
+                '_wp_http_referer': "/my-account/add-payment-method",
                 'woocommerce_add_payment_method': "1"
             }
         
