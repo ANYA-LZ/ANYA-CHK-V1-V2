@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 APPROVED = '𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝 ✅'
 DECLINED = '𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝 ❌'
 ERROR = '𝙀𝙍𝙍𝙊𝙍 ⚠️'
-SUCCESS = '𝓢𝓤𝓒𝓒𝓔𝓢𝓢 ✅'
+SUCCESS = '𝗦𝗨𝗖𝗖𝗘𝗦𝗦 ✅'
 FAILED = '𝙁𝘼𝙄𝙇𝙀𝘿 ❌'
 
 # Configuration
@@ -839,3 +839,4 @@ def handle_payment():
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
     
+
