@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from faker import Faker
 from functools import wraps
+import threading
+import uuid
 
 app = Flask(__name__)
 
@@ -30,8 +32,8 @@ SUCCESS = '𝙎𝙐𝘾𝘾𝞢𝙎𝙎 ✅'
 FAILED = '𝙁𝘼𝙄𝙇𝙀𝘿 ❌'
 
 # Configuration
-REQUEST_TIMEOUT = 60  # Increased from 15 to allow more time for external API calls
-CACHE_EXPIRY = timedelta(minutes=30)
+REQUEST_TIMEOUT = 30  # Reduced from 60 to optimize performance while maintaining reliability
+CACHE_EXPIRY = timedelta(minutes=1)
 
 fake = Faker("en_US")
 DOMAINS = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"]
@@ -52,23 +54,6 @@ def validate_input(func):
             logger.error(f"Validation error in {func.__name__}: {str(e)}")
             return None
     return wrapper
-
-def rate_limited(max_per_minute):
-    """Decorator to limit the rate of function calls"""
-    interval = 60.0 / max_per_minute
-    last_called = [0.0]
-
-    def decorator(func):
-        @wraps(func)
-        def wrapped(*args, **kwargs):
-            elapsed = time.time() - last_called[0]
-            wait = interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
-            last_called[0] = time.time()
-            return func(*args, **kwargs)
-        return wrapped
-    return decorator
 
 def generate_fake_user_agent():
     """Generate a realistic random User-Agent"""
@@ -92,7 +77,7 @@ def fetch_city_zipcode_data():
     
     url = "https://raw.githubusercontent.com/ANYA-LZ/country-map/refs/heads/main/US.json"
     try:
-        response = requests.get(url, timeout=10)  # Reduced timeout for faster failure
+        response = requests.get(url, timeout=8)  # Further reduced timeout for geo data
         response.raise_for_status()
         geo_data = response.json()
         
@@ -175,6 +160,18 @@ def create_new_session(gateway_config, random_person):
     
     # Update headers with random data
     session.headers.update(headers)
+
+    response = session.get(
+            url=origin,
+            timeout=REQUEST_TIMEOUT
+        )
+    
+    response.raise_for_status()
+    
+    if response.status_code != 200:
+        logger.error(f"Failed to fetch initial page, status code: {response.status_code}")
+
+    session.cookies.update(response.cookies)
     
     # Add random cookies to the session
     session.cookies.update(generate_cookies(gateway_config))
@@ -182,67 +179,79 @@ def create_new_session(gateway_config, random_person):
     return session
 
 class SessionManager:
-    """Manages separate sessions for each card number to prevent mixing between requests"""
+    """Manages separate sessions for each request to prevent mixing between requests"""
     
     def __init__(self):
-        self.sessions = {}  # Dictionary to store card_number -> session mapping
+        self.sessions = {}  # Dictionary to store request_id -> session mapping
         self.session_timestamps = {}  # Track session creation time for cleanup
-        self.max_session_age = timedelta(minutes=1)  # Sessions expire after 1 minute
+        self.max_session_age = timedelta(minutes=0.5)  # Sessions expire after 0.5 minutes
+        self.lock = threading.Lock()  # Thread lock for thread safety
 
-    def get_session_key(self, card_number, gateway_url):
-        """Create a unique key for the session based on card number and gateway"""
-        return f"{card_number}_{gateway_url}"
+    def create_request_id(self):
+        """Create a unique request ID for each payment request"""
+        return f"req_{uuid.uuid4().hex[:12]}_{int(time.time())}"
     
-    def get_session(self, card_number, gateway_config, random_person):
-        """Get or create a session for the specific card number"""
-        session_key = self.get_session_key(card_number, gateway_config['url'])
-        
-        # Clean up old sessions first
-        self._cleanup_old_sessions()
-        
-        # Check if we already have a session for this card
-        if session_key not in self.sessions:
-            self.sessions[session_key] = create_new_session(gateway_config, random_person)
-            self.session_timestamps[session_key] = datetime.now()
-        else:
-            pass # Reuse existing session
-        
-        session = self.sessions[session_key]
-        return session
+    def get_session(self, request_id, gateway_config, random_person):
+        """Get or create a session for the specific request ID"""
+        with self.lock:  # Ensure thread safety
+            # Clean up old sessions first
+            self._cleanup_old_sessions()
+            
+            # Always create a new session for each request to ensure complete isolation
+            logger.info(f"Creating new session for request ID: {request_id}")
+            session = create_new_session(gateway_config, random_person)
+            self.sessions[request_id] = session
+            self.session_timestamps[request_id] = datetime.now()
+            
+            return session
     
-    def cleanup_session(self, card_number, gateway_url):
+    def cleanup_session(self, request_id):
         """Remove a specific session from memory"""
-        session_key = self.get_session_key(card_number, gateway_url)
-        if session_key in self.sessions:
-            self.sessions[session_key].close()  # Close the session properly
-            del self.sessions[session_key]
-            if session_key in self.session_timestamps:
-                del self.session_timestamps[session_key]
+        with self.lock:  # Ensure thread safety
+            if request_id in self.sessions:
+                logger.info(f"Cleaning up session for request ID: {request_id}")
+                try:
+                    self.sessions[request_id].close()  # Close the session properly
+                except Exception as e:
+                    logger.warning(f"Error closing session {request_id}: {str(e)}")
+                
+                del self.sessions[request_id]
+                if request_id in self.session_timestamps:
+                    del self.session_timestamps[request_id]
     
     def _cleanup_old_sessions(self):
         """Remove sessions that are older than max_session_age"""
         current_time = datetime.now()
         sessions_to_remove = []
         
-        for session_key, timestamp in self.session_timestamps.items():
+        for request_id, timestamp in self.session_timestamps.items():
             if current_time - timestamp > self.max_session_age:
-                sessions_to_remove.append(session_key)
+                sessions_to_remove.append(request_id)
         
-        for session_key in sessions_to_remove:
-            logger.info(f"Removing expired session: {session_key}")
-            if session_key in self.sessions:
-                self.sessions[session_key].close()
-                del self.sessions[session_key]
-            del self.session_timestamps[session_key]
+        for request_id in sessions_to_remove:
+            logger.info(f"Removing expired session: {request_id}")
+            if request_id in self.sessions:
+                try:
+                    self.sessions[request_id].close()
+                except Exception as e:
+                    logger.warning(f"Error closing expired session {request_id}: {str(e)}")
+                del self.sessions[request_id]
+            if request_id in self.session_timestamps:
+                del self.session_timestamps[request_id]
+    
+    def get_active_sessions_count(self):
+        """Get the count of currently active sessions for monitoring"""
+        with self.lock:
+            return len(self.sessions)
 
 # Global session manager instance
 session_manager = SessionManager()
 
-def get_session(card_number, gateway_config, random_person):
-    """Get a session specific to the card number to prevent mixing between requests"""
-    return session_manager.get_session(card_number, gateway_config, random_person)
+def get_session(request_id, gateway_config, random_person):
+    """Get a session specific to the request ID to prevent mixing between requests"""
+    return session_manager.get_session(request_id, gateway_config, random_person)
 
-def extract_payment_config(card_number, random_person, gateway_config, session=None):
+def extract_payment_config(request_id, card_number, random_person, gateway_config, session):
     result = {
         'nonce': None,
         'pk_live': None,
@@ -252,7 +261,6 @@ def extract_payment_config(card_number, random_person, gateway_config, session=N
     }
     
     try:
-        session = session or get_session(card_number, gateway_config, random_person)
         response = session.post(
             gateway_config['url'],
             data={'_wc_user_reg': 'true'},
@@ -447,8 +455,8 @@ def get_payload_bar_auth_info_v2(auth_token):
         print(f"Invalid response data: {str(e)}")
         return None
 
-def generate_payload_payment(card_number, random_person, gateway_config, card_info, session=None):
-    secrets = extract_payment_config(card_number, random_person, gateway_config, session=session)
+def generate_payload_payment(request_id, card_number, random_person, gateway_config, card_info, session):
+    secrets = extract_payment_config(request_id, card_number, random_person, gateway_config, session=session)
 
     # Corrected the typo from 'gataway_type' to 'gateway_type'
     if "Braintree Auth" in gateway_config['gateway_type']:
@@ -614,7 +622,7 @@ def generate_payload_payment(card_number, random_person, gateway_config, card_in
             
             if not (payment_id := get_stripe_auth_id(random_person, card_info, pk_live, accountId, gateway_config['url'])):
                 logger.error("Failed to fetch ID")
-                return False, "Failed to fetch ID"
+                return False, "Your card was rejected from the gateway"
             
             if not (ajax_nonce := secrets.get('createSetupIntentNonce')):
                 logger.error("Failed to fetch ajax nonce")
@@ -632,15 +640,13 @@ def generate_payload_payment(card_number, random_person, gateway_config, card_in
 
     return True, payload
 
-def delete_payment_method(card_number, gateway_config, random_person, url, session=None):
+def delete_payment_method(request_id, card_number, gateway_config, random_person, url, session):
     """Execute payment method deletion and return success status"""
     try:
-
-        session = session or get_session(card_number, gateway_config, random_person)
         account_response = session.post(
             url=url,
             allow_redirects=True,
-            timeout=REQUEST_TIMEOUT
+            timeout=15  # Shorter timeout for delete operations
         )
         account_response.raise_for_status()
         session.cookies.update(account_response.cookies)
@@ -656,11 +662,10 @@ def delete_payment_method(card_number, gateway_config, random_person, url, sessi
 
         delete_url = delete_links[0]
 
-        session = session or get_session(card_number, gateway_config, random_person)
         delete_response = session.post(
             url=delete_url,
             allow_redirects=True,
-            timeout=REQUEST_TIMEOUT
+            timeout=15  # Shorter timeout for delete operations
         )
         delete_response.raise_for_status()
         session.cookies.update(account_response.cookies)
@@ -674,7 +679,7 @@ def delete_payment_method(card_number, gateway_config, random_person, url, sessi
         logger.error(f"Unexpected error in delete_payment_method: {str(e)}")
         return False
 
-def _parse_payment_response(card_number, content, random_person, gateway_config, session=None):
+def _parse_payment_response(request_id, card_number, content, random_person, gateway_config, session):
     """Parse and interpret payment gateway response (HTML or JSON)"""
     try:
         # First try to parse as JSON
@@ -703,7 +708,7 @@ def _parse_payment_response(card_number, content, random_person, gateway_config,
             success = tree.xpath(success_xpath)
             if success:
                 message = 'Approved'
-                if not delete_payment_method(card_number, gateway_config, random_person, f"{origin}/my-account/payment-methods/", session):
+                if not delete_payment_method(request_id, card_number, gateway_config, random_person, f"{origin}/my-account/payment-methods/", session):
                     message = 'Approved (error delete)'
                 return APPROVED, message
 
@@ -716,7 +721,7 @@ def _parse_payment_response(card_number, content, random_person, gateway_config,
                 
                 if "Duplicate card exists in the vault" in extracted_message:
                     extracted_message = 'Approved old try again'
-                    if not delete_payment_method(card_number, gateway_config, random_person, f"{origin}/my-account/payment-methods/", session):
+                    if not delete_payment_method(request_id, card_number, gateway_config, random_person, f"{origin}/my-account/payment-methods/", session):
                         extracted_message = 'Approved old try again (error delete)'
                     return APPROVED, extracted_message
 
@@ -731,17 +736,21 @@ def _parse_payment_response(card_number, content, random_person, gateway_config,
         return ERROR, f"Parsing failed: {str(e)}"
 
 
-def process_payment(gateway_config, card_info, random_person, session=None):
-
+def process_payment(request_id, gateway_config, card_info, random_person, session):
+    start_time = time.time()
     card_number = card_info['number']
-    status, result = generate_payload_payment(card_number, random_person, gateway_config, card_info, session)
+    
+    # Log payload generation start
+    logger.info(f"🔧 [REQUEST {request_id}] Generating payment payload...")
+    status, result = generate_payload_payment(request_id, card_number, random_person, gateway_config, card_info, session)
     if not status:
         return ERROR, result
     
     payload = result
+    payload_time = time.time() - start_time
+    logger.info(f"⏱️ [REQUEST {request_id}] Payload generated in {payload_time:.2f}s")
 
     try:
-        session = session or get_session(card_number, gateway_config, random_person)
         response = session.post(
             url=gateway_config["post_url"],
             data=payload,
@@ -751,89 +760,121 @@ def process_payment(gateway_config, card_info, random_person, session=None):
         session.cookies.update(response.cookies)
         
         # Parse response and clean up session after processing
-        status, message = _parse_payment_response(card_number, response.content, random_person, gateway_config, session)
+        status, message = _parse_payment_response(request_id, card_number, response.content, random_person, gateway_config, session)
         
-        # Clean up the session for this card to free memory
-        session_manager.cleanup_session(card_number, gateway_config['url'])
+        # Clean up the session for this request to free memory
+        session_manager.cleanup_session(request_id)
         
         return status, message
         
     except requests.RequestException as e:
-        logger.error(f"Payment request failed: {str(e)}")
+        logger.error(f"Payment request failed for {request_id}: {str(e)}")
         # Clean up session on error as well
-        session_manager.cleanup_session(card_number, gateway_config['url'])
+        session_manager.cleanup_session(request_id)
         return ERROR, f"Request failed: {str(e)}"
 
 @app.route('/')
 def index():
-    return "Payment Gateway Service"
+    return "Payment Gateway Service - Request Isolation Enabled"
+
+@app.route('/status')
+def system_status():
+    """Get system status including active sessions count"""
+    active_sessions = session_manager.get_active_sessions_count()
+    return jsonify({
+        "status": "running",
+        "active_sessions": active_sessions,
+        "isolation_mode": "request_based",
+        "timestamp": datetime.now().isoformat()
+    })
 
 @app.route('/payment', methods=['POST'])
 def handle_payment():
+    # Generate unique request ID for complete isolation
+    request_id = session_manager.create_request_id()
     start_time = time.time()
-    logger.info("Received payment request")
+    
+    logger.info(f"🔄 [REQUEST {request_id}] Started payment request processing")
     
     try:
         data = request.get_json()
         if not data:
-            logger.error("No data received in request")
+            logger.error(f"❌ [REQUEST {request_id}] No data received in request")
             return jsonify({"status": ERROR, "result": "No data received"}), 400
         
         # Validate gateway configuration
         gateway_config = data.get('gateway_config')
         if not gateway_config:
-            logger.error("Missing gateway configuration")
+            logger.error(f"❌ [REQUEST {request_id}] Missing gateway configuration")
             return jsonify({"status": ERROR, "result": "Gateway configuration is missing"}), 400
         
         # Validate card information
         card_info = data.get('card')
         if not card_info:
-            logger.error("No card information provided")
+            logger.error(f"❌ [REQUEST {request_id}] No card information provided")
             return jsonify({"status": ERROR, "result": "Card information is missing"}), 400
         
         required_card_fields = ['number', 'month', 'year', 'cvv']
         for field in required_card_fields:
             if field not in card_info or not card_info[field]:
-                logger.error(f"Missing required card field: {field}")
+                logger.error(f"❌ [REQUEST {request_id}] Missing required card field: {field}")
                 return jsonify({"status": ERROR, "result": f"{field} is missing in card info"}), 400
         
         # Log card identification for debugging (only last 4 digits)
         card_number = card_info['number']
-        logger.info(f"Processing payment for card ending in: {card_number[-4:]}")
+        logger.info(f"💳 [REQUEST {request_id}] Processing payment for card ending in: {card_number[-4:]}")
+        logger.info(f"📊 [REQUEST {request_id}] Active sessions count: {session_manager.get_active_sessions_count()}")
             
         # Generate random person profile
         random_person = generate_random_person()
         if not random_person:
-            logger.error("Failed to generate random person profile")
+            logger.error(f"❌ [REQUEST {request_id}] Failed to generate random person profile")
             return jsonify({"status": ERROR, "result": "Failed to generate random person"}), 400
+        
+        logger.info(f"👤 [REQUEST {request_id}] Generated profile for: {random_person['first_name']} {random_person['last_name']}")
+        
+        # Get isolated session for this specific request
+        session = get_session(request_id, gateway_config, random_person)
+        logger.info(f"🔗 [REQUEST {request_id}] Created isolated session")
             
-        # Process payment with card-specific session
+        # Process payment with request-specific session
         status, result = process_payment(
+            request_id,
             gateway_config,
             card_info,
-            random_person
+            random_person,
+            session=session
         )
         
-        logger.info(f"Payment processed for card ending in {card_number[-4:]} - Status: {status}, Result: {result}")
-        logger.info(f"Request processing time: {time.time() - start_time:.2f} seconds")
+        processing_time = time.time() - start_time
+        logger.info(f"✅ [REQUEST {request_id}] Payment processed - Status: {status}, Result: {result}")
+        logger.info(f"⏱️ [REQUEST {request_id}] Total processing time: {processing_time:.2f} seconds")
+        logger.info(f"🧹 [REQUEST {request_id}] Session cleanup completed")
 
         if ERROR in status:
             return jsonify({
                 "status": status,
                 "result": result,
+                "request_id": request_id,
+                "processing_time": round(processing_time, 2)
             }), 400
         
         else:
             return jsonify({
                 "status": status,
                 "result": result,
+                "request_id": request_id,
+                "processing_time": round(processing_time, 2)
             }), 200
         
     except Exception as e:
-        logger.error(f"Unexpected error in handle_payment: {str(e)}", exc_info=True)
+        # Ensure session cleanup even on unexpected errors
+        session_manager.cleanup_session(request_id)
+        logger.error(f"💥 [REQUEST {request_id}] Unexpected error: {str(e)}", exc_info=True)
         return jsonify({
             "status": ERROR,
-            "result": "Internal server error"
+            "result": "Internal server error",
+            "request_id": request_id
         }), 500
 
 if __name__ == '__main__':
