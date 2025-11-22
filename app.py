@@ -143,7 +143,7 @@ def create_new_session(gateway_config, random_person):
     origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
     """Create a new session with random data"""
 
-    if "v1_with_cookies" in gateway_config['version']:
+    if gateway_config.get('bypass_cloudscraper', False):
         session = cloudscraper.create_scraper()
     else:
         session = requests.Session()
