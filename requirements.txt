@@ -5,3 +5,4 @@ lxml
 gunicorn
 urllib3
 python-dateutil
+cloudscraper
