@@ -13,6 +13,7 @@ from faker import Faker
 from functools import wraps
 import threading
 import uuid
+import cloudscraper
 
 app = Flask(__name__)
 
@@ -141,7 +142,11 @@ def create_new_session(gateway_config, random_person):
     parsed_url = urlparse(gateway_config['url'])
     origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
     """Create a new session with random data"""
-    session = requests.Session()
+
+    if "v1_with_cookies" in gateway_config['version']:
+        session = cloudscraper.create_scraper()
+    else:
+        session = requests.Session()
 
     headers = {
         'User-Agent': random_person['user_agent'],
@@ -257,7 +262,7 @@ def extract_payment_config(request_id, card_number, random_person, gateway_confi
         'pk_live': None,
         'accountId': None,
         'createSetupIntentNonce': None,
-        'email': None  # Added email field
+        'email': None
     }
     
     try:
@@ -266,33 +271,41 @@ def extract_payment_config(request_id, card_number, random_person, gateway_confi
             data={'_wc_user_reg': 'true'},
             timeout=REQUEST_TIMEOUT
         )
+
         response.raise_for_status()
+
+        # Important for next requests
         session.cookies.update(response.cookies)
 
-        # 1. Extract NONCE from HTML
+        # Parse HTML
         tree = html.fromstring(response.content)
+
+        # Extract WooCommerce nonce
         nonce = tree.xpath('//input[@id="woocommerce-add-payment-method-nonce"]/@value')
         result['nonce'] = nonce[0] if nonce else None
 
-        # 2. Extract other data from JavaScript
+        # Read entire HTML as text
         script_content = response.text
         
-        # Regex for Stripe keys, nonces, and email
-        pk_match = re.search(r'"publishableKey":"(pk_live_[^"]+)"', script_content)
-        account_match = re.search(r'"accountId":"(acct_[^"]+)"', script_content)
-        setup_intent_nonce_match = re.search(r'"createSetupIntentNonce":"([^"]+)"', script_content)
-        email_match = re.search(r'"email":"([^"]+)"', script_content)
+        # Regex for Stripe keys and config
+        result['pk_live'] = re.search(r'"publishableKey":"(pk_live_[^"]+)"', script_content).group(1) \
+                            if re.search(r'"publishableKey":"(pk_live_[^"]+)"', script_content) else None
+
+        result['accountId'] = re.search(r'"accountId":"(acct_[^"]+)"', script_content).group(1) \
+                              if re.search(r'"accountId":"(acct_[^"]+)"', script_content) else None
+
+        result['createSetupIntentNonce'] = re.search(r'"createSetupIntentNonce":"([^"]+)"', script_content).group(1) \
+                                           if re.search(r'"createSetupIntentNonce":"([^"]+)"', script_content) else None
         
-        result['pk_live'] = pk_match.group(1) if pk_match else None
-        result['accountId'] = account_match.group(1) if account_match else None
-        result['createSetupIntentNonce'] = setup_intent_nonce_match.group(1) if setup_intent_nonce_match else None
-        result['email'] = email_match.group(1) if email_match else None
+        result['email'] = re.search(r'"email":"([^"]+)"', script_content).group(1) \
+                          if re.search(r'"email":"([^"]+)"', script_content) else None
 
         return result
 
     except requests.RequestException as e:
         logging.error(f"Request failed: {str(e)}")
         return result
+
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return result
