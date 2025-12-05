@@ -26,8 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Response messages
-APPROVED = '𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝 ✅'
-DECLINED = '𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝 ❌'
+APPROVED = '𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 ✅'
+DECLINED = '𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 ❌'
 ERROR = '𝙀𝙍𝙍𝙊𝙍 ⚠️'
 SUCCESS = '𝙎𝙐𝘾𝘾𝞢𝙎𝙎 ✅'
 FAILED = '𝙁𝘼𝙄𝙇𝙀𝘿 ❌'
@@ -844,8 +844,6 @@ def delete_payment_method(request_id, card_number, gateway_config, random_person
 def _parse_payment_response(request_id, card_number, content, random_person, gateway_config, session):
     """Parse and interpret payment gateway response (HTML or JSON)"""
     try:
-        with open("response.txt", "w", encoding="utf-8") as f:
-            f.write(content.decode('utf-8', errors='ignore'))
         try:
             data = json.loads(content)
             
