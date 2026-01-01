@@ -130,6 +130,116 @@ def _format_phone_number(zipcode):
     base_num = fake.numerify("###-###-####")
     return f"({zipcode[:3]}) {base_num}"
 
+def parse_proxy(proxy_string):
+    """
+    Parse proxy string in various formats and return properly formatted proxy URL.
+    
+    Supported formats:
+    - host:port:username:password (most common)
+    - username:password@host:port
+    - host:port (no auth)
+    - http://host:port
+    - http://username:password@host:port
+    - socks5://host:port
+    - socks5://username:password@host:port
+    """
+    if not proxy_string:
+        return None
+    
+    proxy_string = proxy_string.strip()
+    
+    # If already in URL format (starts with http://, https://, socks4://, socks5://)
+    if proxy_string.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+        return proxy_string
+    
+    # Check if it's in format username:password@host:port
+    if '@' in proxy_string:
+        # Already has @ format, just add http:// prefix
+        return f"http://{proxy_string}"
+    
+    parts = proxy_string.split(':')
+    
+    if len(parts) == 2:
+        # Format: host:port (no authentication)
+        host, port = parts
+        return f"http://{host}:{port}"
+    
+    elif len(parts) == 4:
+        # Format: host:port:username:password
+        host, port, username, password = parts
+        return f"http://{username}:{password}@{host}:{port}"
+    
+    elif len(parts) == 3:
+        # Could be host:port:username (incomplete) - treat as invalid
+        # Or could be ip:port:port (invalid)
+        logger.warning(f"Invalid proxy format with 3 parts: {proxy_string}")
+        return None
+    
+    else:
+        logger.warning(f"Unrecognized proxy format: {proxy_string}")
+        return None
+
+def get_proxy_dict(gateway_config):
+    """
+    Get proxy dictionary from gateway_config.
+    Returns None if no proxy or invalid proxy.
+    """
+    if 'proxy' not in gateway_config or not gateway_config['proxy']:
+        return None
+    
+    proxy_url = parse_proxy(gateway_config['proxy'])
+    if not proxy_url:
+        return None
+    
+    return {'http': proxy_url, 'https': proxy_url}
+
+def is_proxy_error(exception):
+    """
+    Check if the exception is related to proxy issues.
+    Returns tuple (is_proxy_error, error_message)
+    """
+    error_str = str(exception).lower()
+    
+    # Check for ProxyError
+    if 'proxyerror' in type(exception).__name__.lower():
+        return True, "Proxy connection failed"
+    
+    # Check for common proxy-related error messages
+    proxy_indicators = [
+        'proxy',
+        'tunnel',
+        'cannot connect to proxy',
+        'proxy authentication required',
+        '407',  # Proxy Authentication Required
+        'socks',
+        'connection refused',
+        'connection reset',
+        'connection aborted',
+        'unable to connect',
+        'max retries exceeded',
+        'newconnectionerror',
+        'proxyconnectionerror',
+    ]
+    
+    for indicator in proxy_indicators:
+        if indicator in error_str:
+            if 'authentication' in error_str or '407' in error_str:
+                return True, "Proxy authentication failed"
+            elif 'refused' in error_str:
+                return True, "Proxy connection refused"
+            elif 'timeout' in error_str:
+                return True, "Proxy connection timeout"
+            elif 'reset' in error_str or 'aborted' in error_str:
+                return True, "Proxy connection reset"
+            else:
+                return True, "Proxy error"
+    
+    # Check for connection timeout which might be proxy-related
+    if 'connecttimeout' in type(exception).__name__.lower():
+        return True, "Proxy connection timeout"
+    
+    return False, None
+
 def generate_cookies(gateway_config):
     cookies_list = gateway_config.get("cookies", [])
     cookies_dict = {}
@@ -151,6 +261,19 @@ def create_new_session(gateway_config, random_person):
     else:
         session = requests.Session()
 
+    # Set proxy if provided in gateway_config
+    using_proxy = False
+    proxy_url = None
+    if 'proxy' in gateway_config and gateway_config['proxy']:
+        proxy_url = parse_proxy(gateway_config['proxy'])
+        if proxy_url:
+            session.proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+            using_proxy = True
+            logger.info(f"Using proxy: {proxy_url}")
+
     headers = {
         'User-Agent': random_person['user_agent'],
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -169,22 +292,69 @@ def create_new_session(gateway_config, random_person):
     # Update headers with random data
     session.headers.update(headers)
 
-    response = session.get(
-            url=origin,
-            timeout=REQUEST_TIMEOUT
-        )
-    
-    response.raise_for_status()
-    
-    if response.status_code != 200:
-        logger.error(f"Failed to fetch initial page, status code: {response.status_code}")
+    try:
+        response = session.get(
+                url=origin,
+                timeout=REQUEST_TIMEOUT
+            )
+        
+        response.raise_for_status()
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch initial page, status code: {response.status_code}")
 
-    session.cookies.update(response.cookies)
-    
-    if "cookies" in gateway_config and "without_cookies" not in gateway_config.get('version', '').lower():
-        session.cookies.update(generate_cookies(gateway_config))
+        session.cookies.update(response.cookies)
+        
+        if "cookies" in gateway_config and "without_cookies" not in gateway_config.get('version', '').lower():
+            session.cookies.update(generate_cookies(gateway_config))
 
-    return session
+        return session
+    
+    except Exception as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err or using_proxy:
+            error_type = categorize_proxy_error(e)
+            logger.error(f"Proxy error during session creation: {error_type}")
+            raise ProxyConnectionError(error_type)
+        else:
+            raise
+
+
+class ProxyConnectionError(Exception):
+    """Custom exception for proxy-related errors"""
+    def __init__(self, message):
+        self.message = message
+        super().__init__(self.message)
+
+
+def categorize_proxy_error(exception):
+    """Categorize proxy errors into user-friendly messages"""
+    error_str = str(exception).lower()
+    
+    # Check specific causes first (more specific to less specific)
+    if 'remotedisconnected' in error_str or 'remote end closed' in error_str:
+        return "Proxy Disconnected"
+    elif 'closed connection' in error_str:
+        return "Proxy Connection Closed"
+    elif 'timeout' in error_str or 'timed out' in error_str:
+        return "Proxy Timeout"
+    elif 'refused' in error_str:
+        return "Proxy Refused"
+    elif 'reset' in error_str or 'aborted' in error_str:
+        return "Proxy Reset"
+    elif 'authentication' in error_str or '407' in error_str:
+        return "Proxy Auth Failed"
+    elif 'unable to connect to proxy' in error_str:
+        return "Proxy Unreachable"
+    elif 'socks' in error_str:
+        return "SOCKS Proxy Error"
+    elif 'tunnel' in error_str:
+        return "Proxy Tunnel Failed"
+    elif 'max retries' in error_str:
+        return "Proxy Failed"
+    else:
+        return "Proxy Error"
 
 class SessionManager:
     """Manages separate sessions for each request to prevent mixing between requests"""
@@ -324,6 +494,13 @@ def extract_payment_config(request_id, card_number, random_person, gateway_confi
         return result
 
     except requests.RequestException as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logging.error(f"Proxy error in extract_payment_config: {error_message}")
+            result['proxy_error'] = error_message
+            return result
         logging.error(f"Request failed: {str(e)}")
         return result
 
@@ -332,7 +509,7 @@ def extract_payment_config(request_id, card_number, random_person, gateway_confi
         return result
     
 @validate_input
-def get_stripe_auth_id(random_person, card_info, publishable_key, account_id, url):
+def get_stripe_auth_id(random_person, card_info, publishable_key, account_id, url, gateway_config=None):
     """Generate payment token through Braintree API"""
     parsed_url = urlparse(url)
     origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -374,12 +551,16 @@ def get_stripe_auth_id(random_person, card_info, publishable_key, account_id, ur
         '_stripe_account': account_id
     }
 
+    # Set proxy if provided
+    proxies = get_proxy_dict(gateway_config) if gateway_config else None
+
     try:
         response = requests.post(
             'https://api.stripe.com/v1/payment_methods',
             headers=headers,
             data=payload,
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
+            proxies=proxies
         )
         response.raise_for_status()
         response_data = response.json()
@@ -390,6 +571,12 @@ def get_stripe_auth_id(random_person, card_info, publishable_key, account_id, ur
         return payment_id
         
     except requests.RequestException as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"Proxy error in get_stripe_auth_id: {error_message}")
+            return f"PROXY_ERROR:{error_message}"
         logger.error(f"Request failed in get_token: {str(e)}")
         return False
     except (KeyError, ValueError) as e:
@@ -428,8 +615,11 @@ def get_stripe_charge_v1_info(apikey, widget_id, random_person, gateway_config):
         'pk_live': None
     }
 
+    # Set proxy if provided
+    proxies = get_proxy_dict(gateway_config)
+
     try:
-        response = requests.post(url, data=json.dumps(payload), headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requests.post(url, data=json.dumps(payload), headers=headers, timeout=REQUEST_TIMEOUT, proxies=proxies)
         response.raise_for_status()
         json_response = response.json()
         payment_element = json_response.get("PaymentElement", {})
@@ -444,6 +634,13 @@ def get_stripe_charge_v1_info(apikey, widget_id, random_person, gateway_config):
         return result
     
     except requests.RequestException as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"Proxy error in get_stripe_charge_v1_info: {error_message}")
+            result['proxy_error'] = error_message
+            return result
         logger.error(f"Request failed in get_token: {str(e)}")
         return result
     except (KeyError, ValueError) as e:
@@ -451,7 +648,7 @@ def get_stripe_charge_v1_info(apikey, widget_id, random_person, gateway_config):
         return result
     
 @validate_input
-def get_bar_auth_token(payload, card_info, random_person, access_token):
+def get_bar_auth_token(payload, card_info, random_person, access_token, gateway_config=None):
     """Generate payment token through Braintree API"""
     
     if not isinstance(random_person, dict) or 'zipcode' not in random_person:
@@ -464,12 +661,16 @@ def get_bar_auth_token(payload, card_info, random_person, access_token):
         'Content-Type': 'application/json',
     }
 
+    # Set proxy if provided
+    proxies = get_proxy_dict(gateway_config) if gateway_config else None
+
     try:
         response = requests.post(
             'https://payments.braintree-api.com/graphql',
             headers=headers,
             json=payload,
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
+            proxies=proxies
         )
         response.raise_for_status()
         response_data = response.json()
@@ -485,13 +686,19 @@ def get_bar_auth_token(payload, card_info, random_person, access_token):
         return token, brandCode
         
     except requests.RequestException as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"Proxy error in get_bar_auth_token: {error_message}")
+            return f"PROXY_ERROR:{error_message}", None
         logger.error(f"Request failed in get_token: {str(e)}")
         return None, None
     except (KeyError, ValueError) as e:
         logger.error(f"Invalid response data: {str(e)}")
         return None, None
 
-def get_payload_bar_auth_info_v2(auth_token):
+def get_payload_bar_auth_info_v2(auth_token, gateway_config=None):
 
     url = "https://payments.braintree-api.com/graphql"
     
@@ -513,12 +720,16 @@ def get_payload_bar_auth_info_v2(auth_token):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
 
+    # Set proxy if provided
+    proxies = get_proxy_dict(gateway_config) if gateway_config else None
+
     try:
         response = requests.post(
             url,
             json=payload,
             headers=headers,
-            timeout=15  # Increased from 10 to 15 seconds
+            timeout=15,  # Increased from 10 to 15 seconds
+            proxies=proxies
         )
 
         # Check for HTTP errors
@@ -534,6 +745,12 @@ def get_payload_bar_auth_info_v2(auth_token):
         return config_data["data"]["clientConfiguration"]
 
     except requests.exceptions.RequestException as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"Proxy error in get_payload_bar_auth_info_v2: {error_message}")
+            return f"PROXY_ERROR:{error_message}"
         print(f"Request failed: {str(e)}")
         return None
     except json.JSONDecodeError as e:
@@ -545,6 +762,10 @@ def get_payload_bar_auth_info_v2(auth_token):
 
 def generate_payload_payment(request_id, card_number, random_person, gateway_config, card_info, session):
     secrets = extract_payment_config(request_id, card_number, random_person, gateway_config, session=session)
+
+    # Check for proxy error in secrets
+    if secrets.get('proxy_error'):
+        return False, secrets['proxy_error'], None
 
     # Initialize info to None as it may not be set in all branches
     info = None
@@ -589,8 +810,14 @@ def generate_payload_payment(request_id, card_number, random_person, gateway_con
                 payload_auth,
                 card_info,
                 random_person,
-                gateway_config["access_token"]
+                gateway_config["access_token"],
+                gateway_config
             )
+
+            # Check for proxy error
+            if isinstance(token, str) and token.startswith("PROXY_ERROR:"):
+                proxy_msg = token.replace("PROXY_ERROR:", "")
+                return False, proxy_msg, None
 
             if not token or not brandCode:
                 logger.error("Failed to get token or brand code")
@@ -647,14 +874,26 @@ def generate_payload_payment(request_id, card_number, random_person, gateway_con
                 payload_auth,
                 card_info,
                 random_person,
-                gateway_config["access_token"]
+                gateway_config["access_token"],
+                gateway_config
             )
+
+            # Check for proxy error
+            if isinstance(token, str) and token.startswith("PROXY_ERROR:"):
+                proxy_msg = token.replace("PROXY_ERROR:", "")
+                return False, proxy_msg, None
 
             if not token or not brandCode:
                 logger.error("Failed to get token or brand code")
                 return False, "Failed to fetch token or brand code", None
             
-            payload_config = get_payload_bar_auth_info_v2(gateway_config["access_token"])
+            payload_config = get_payload_bar_auth_info_v2(gateway_config["access_token"], gateway_config)
+            
+            # Check for proxy error in payload_config
+            if isinstance(payload_config, str) and payload_config.startswith("PROXY_ERROR:"):
+                proxy_msg = payload_config.replace("PROXY_ERROR:", "")
+                return False, proxy_msg, None
+            
             if not payload_config:
                 logger.error("Failed to get Braintree Auth payload info v2")
                 return False, "Failed to get Braintree Auth payload info v2", None
@@ -711,9 +950,14 @@ def generate_payload_payment(request_id, card_number, random_person, gateway_con
                 logger.error("Failed to fetch email")
                 return False, "Failed to fetch email", None
             
-            if not (payment_id := get_stripe_auth_id(random_person, card_info, pk_live, accountId, gateway_config['url'])):
+            if not (payment_id := get_stripe_auth_id(random_person, card_info, pk_live, accountId, gateway_config['url'], gateway_config)):
                 logger.error("Failed to fetch ID")
                 return False, "Your card was rejected from the gateway", None
+            
+            # Check for proxy error
+            if isinstance(payment_id, str) and payment_id.startswith("PROXY_ERROR:"):
+                proxy_msg = payment_id.replace("PROXY_ERROR:", "")
+                return False, proxy_msg, None
             
             if not (ajax_nonce := secrets.get('createSetupIntentNonce')):
                 logger.error("Failed to fetch ajax nonce")
@@ -742,6 +986,10 @@ def generate_payload_payment(request_id, card_number, random_person, gateway_con
                 return False, "Failed to fetch widgetId", None
             
             payment_info = get_stripe_charge_v1_info(api_key, widget_id, random_person, gateway_config)
+            
+            # Check for proxy error
+            if payment_info.get('proxy_error'):
+                return False, payment_info['proxy_error'], None
             
             if not (Payment_intent_id := payment_info.get('PaymentIntentId')):
                 logger.error("Failed to fetch PaymentIntentId")
@@ -847,6 +1095,10 @@ def _parse_payment_response(request_id, card_number, content, random_person, gat
         try:
             data = json.loads(content)
             
+            # Check for proxy error first
+            if 'proxy_error' in data:
+                return ERROR, data['proxy_error']
+            
             # Check for Stripe Charge success (payment_intent with status succeeded)
             if data.get('status') == 'succeeded':
                 message = 'Succeeded'
@@ -920,7 +1172,7 @@ def _parse_payment_response(request_id, card_number, content, random_person, gat
         logger.error(f"Response parsing failed: {str(e)}")
         return ERROR, f"Parsing failed: {str(e)}"
     
-def confirm_payment_intent(payload, info, random_person):
+def confirm_payment_intent(payload, info, random_person, gateway_config=None):
 
     url = info
 
@@ -932,9 +1184,26 @@ def confirm_payment_intent(payload, info, random_person):
         'referer': "https://js.stripe.com/"
     }
 
-    response = requests.post(url, data=payload, headers=headers)
+    # Set proxy if provided
+    proxies = get_proxy_dict(gateway_config) if gateway_config else None
 
-    return response
+    try:
+        response = requests.post(url, data=payload, headers=headers, proxies=proxies, timeout=REQUEST_TIMEOUT)
+        return response
+    except requests.RequestException as e:
+        # Check if it's a proxy error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"Proxy error in confirm_payment_intent: {error_message}")
+            # Return a fake response object with proxy error
+            class ProxyErrorResponse:
+                content = json.dumps({"proxy_error": error_message}).encode()
+                text = json.dumps({"proxy_error": error_message})
+                status_code = 0
+            return ProxyErrorResponse()
+        logger.error(f"Request failed in confirm_payment_intent: {str(e)}")
+        raise
 
 def process_payment(request_id, gateway_config, card_info, random_person, session):
     start_time = time.time()
@@ -953,7 +1222,7 @@ def process_payment(request_id, gateway_config, card_info, random_person, sessio
     try:
         if "Stripe Charge" in gateway_config['gateway_type']:
             if "v1_without_cookies" in gateway_config['version']:
-                response = confirm_payment_intent(payload, info, random_person)
+                response = confirm_payment_intent(payload, info, random_person, gateway_config)
         else:
             response = session.post(
                 url=gateway_config["post_url"],
@@ -975,6 +1244,14 @@ def process_payment(request_id, gateway_config, card_info, random_person, sessio
         logger.error(f"Payment request failed for {request_id}: {str(e)}")
         # Clean up session on error as well
         session_manager.cleanup_session(request_id)
+        
+        # Check if it's a proxy error and provide user-friendly message
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"🔴 [REQUEST {request_id}] Proxy error detected: {error_message}")
+            return ERROR, error_message
+        
         return ERROR, f"Request failed: {str(e)}"
 
 @app.route('/')
@@ -1038,8 +1315,18 @@ def handle_payment():
         logger.info(f"👤 [REQUEST {request_id}] Generated profile for: {random_person['first_name']} {random_person['last_name']}")
         
         # Get isolated session for this specific request
-        session = get_session(request_id, gateway_config, random_person)
-        logger.info(f"🔗 [REQUEST {request_id}] Created isolated session")
+        try:
+            session = get_session(request_id, gateway_config, random_person)
+            logger.info(f"🔗 [REQUEST {request_id}] Created isolated session")
+        except ProxyConnectionError as proxy_err:
+            processing_time = time.time() - start_time
+            logger.error(f"🔴 [REQUEST {request_id}] Proxy connection failed: {proxy_err.message}")
+            return jsonify({
+                "status": ERROR,
+                "result": proxy_err.message,
+                "request_id": request_id,
+                "processing_time": round(processing_time, 2)
+            }), 400
             
         # Process payment with request-specific session
         status, result = process_payment(
@@ -1070,10 +1357,34 @@ def handle_payment():
                 "request_id": request_id,
                 "processing_time": round(processing_time, 2)
             }), 200
+    
+    except ProxyConnectionError as proxy_err:
+        # Handle proxy errors specifically
+        session_manager.cleanup_session(request_id)
+        processing_time = time.time() - start_time
+        logger.error(f"🔴 [REQUEST {request_id}] Proxy error: {proxy_err.message}")
+        return jsonify({
+            "status": ERROR,
+            "result": proxy_err.message,
+            "request_id": request_id,
+            "processing_time": round(processing_time, 2)
+        }), 400
         
     except Exception as e:
         # Ensure session cleanup even on unexpected errors
         session_manager.cleanup_session(request_id)
+        
+        # Check if it's a proxy-related error
+        is_proxy_err, proxy_msg = is_proxy_error(e)
+        if is_proxy_err:
+            error_message = categorize_proxy_error(e)
+            logger.error(f"🔴 [REQUEST {request_id}] Proxy error: {error_message}")
+            return jsonify({
+                "status": ERROR,
+                "result": error_message,
+                "request_id": request_id
+            }), 400
+        
         logger.error(f"💥 [REQUEST {request_id}] Unexpected error: {str(e)}", exc_info=True)
         return jsonify({
             "status": ERROR,
