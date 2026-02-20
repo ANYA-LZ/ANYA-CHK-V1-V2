@@ -31,9 +31,9 @@ DECLINED = '𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 ❌'
 ERROR = '𝙀𝙍𝙍𝙊𝙍 ⚠️'
 SUCCESS = '𝙎𝙐𝘾𝘾𝞢𝙎𝙎 ✅'
 FAILED = '𝙁𝘼𝙄𝙇𝙀𝘿 ❌'
-CHARGE = '𝘾𝙝𝙖𝙧𝙜𝙚 ✅'
+CHARGE = '𝘾𝙃𝘼𝙍𝙂𝙀𝘿 ✅'
 INSUFFICIENT_FUNDS = '𝙄𝙣𝙨𝙪𝙛𝙛𝙞𝙘𝙞𝙚𝙣𝙩 𝙁𝙪𝙣𝙙𝙨 ☑️'
-PASSAD = '𝙋𝘼𝙎𝙎𝘼𝘿 ❎'
+PASSAD = '𝙋𝘼𝙎𝙎𝙀𝘿 ❎'
 
 # Configuration
 REQUEST_TIMEOUT = 30  # Reduced from 60 to optimize performance while maintaining reliability
