@@ -6,3 +6,13 @@ gunicorn
 urllib3
 python-dateutil
 cloudscraper
+
+requests
+flask
+lxml
+faker
+cloudscraper
+cryptography
+urllib3
+gunicorn
+python-dateutil
