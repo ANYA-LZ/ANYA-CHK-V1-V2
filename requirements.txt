@@ -1,12 +1,3 @@
-Flask
-requests
-Faker
-lxml
-gunicorn
-urllib3
-python-dateutil
-cloudscraper
-
 requests
 flask
 lxml
